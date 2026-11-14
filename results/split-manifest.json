@@ -1,0 +1,13 @@
+{
+  "seed": 61113,
+  "splits": {
+    "dev": {
+      "questions": 28,
+      "sha256": "51789824264eedd4ba49b94b2c980fdf731d62a057abc340f9479dd7413237c7"
+    },
+    "evaluation": {
+      "questions": 240,
+      "sha256": "e005add3c18a92d975c47cd7433b7c04fd0c5e1d9d2489a0e74a0c721c7a1fff"
+    }
+  }
+}

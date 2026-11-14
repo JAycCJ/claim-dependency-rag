@@ -1,0 +1,587 @@
+diff --git a/frontend/src/App.tsx b/frontend/src/App.tsx
+index 1c80dd9..4b0fd52 100644
+--- a/frontend/src/App.tsx
++++ b/frontend/src/App.tsx
+@@ -108,8 +108,10 @@ export default function App() {
+   const [question, setQuestion] = useState("");
+   const [busy, setBusy] = useState(false);
+   const [error, setError] = useState("");
+-  const [modelSettings, setModelSettings] = useState(() => selectProvider("aihubmix"));
+-  const [showKey, setShowKey] = useState(false);
++  const [modelSettings, setModelSettings] = useState(() => window.location.hash === "#fenno"
++    ? { ...selectProvider("custom"), baseUrl: "https://api.fenno.ai/v1" }
++    : selectProvider("aihubmix"));
++  const [showKey, setShowKey] = useState(() => window.location.hash === "#fenno");
+   const [health, setHealth] = useState<"checking" | "ready" | "unavailable">("checking");
+   const [sourceCount, setSourceCount] = useState<number | null>(null);
+   const bottom = useRef<HTMLDivElement>(null);
+diff --git a/frontend/src/ModelSettingsPanel.tsx b/frontend/src/ModelSettingsPanel.tsx
+index a8ea608..1720077 100644
+--- a/frontend/src/ModelSettingsPanel.tsx
++++ b/frontend/src/ModelSettingsPanel.tsx
+@@ -22,14 +22,14 @@ export function ModelSettingsPanel({ settings, onChange, busy }: Props) {
+     }
+     onChange(next);
+   }
+-  async function check(action: "models" | "test") {
++  async function check(action: "models" | "test" | "fenno-dev-pilot", single = false, full = false) {
+     setWorking(true); setNotice(""); setFailed(false);
+     if (action === "models") {
+       setModels([]);
+       onChange({ ...settings, model: "" });
+     }
+     try {
+-      const response = await scopedFetch(`/api/llm/${action}`, {
++      const response = await scopedFetch(`/api/llm/${action}${full ? "?full=true" : single ? "?single=true" : ""}`, {
+         method: "POST", headers: { "Content-Type": "application/json" },
+         body: JSON.stringify({ provider: settings.provider, api_key: settings.apiKey.trim(), model: settings.model.trim() || undefined,
+           base_url: custom ? settings.baseUrl.trim() || undefined : undefined }),
+@@ -69,6 +69,9 @@ export function ModelSettingsPanel({ settings, onChange, busy }: Props) {
+     <div className="model-actions">
+       <button type="button" disabled={!settings.apiKey.trim() || (custom && !settings.baseUrl.trim())} onClick={() => void check("models")}>Load models</button>
+       <button type="button" disabled={!settings.apiKey.trim() || !settings.model.trim() || (custom && !settings.baseUrl.trim())} onClick={() => void check("test")}>Test connection</button>
++      {custom && settings.baseUrl === "https://api.fenno.ai/v1" && settings.model === "gpt-6.1-sol" && <button type="button" disabled={!settings.apiKey.trim()} onClick={() => void check("fenno-dev-pilot")}>Run 8 development requests</button>}
++      {custom && settings.baseUrl === "https://api.fenno.ai/v1" && settings.model === "gpt-6.1-sol" && <button type="button" disabled={!settings.apiKey.trim()} onClick={() => void check("fenno-dev-pilot", true)}>Run one C4 retry</button>}
++      {custom && settings.baseUrl === "https://api.fenno.ai/v1" && settings.model === "gpt-6.1-sol" && <button type="button" disabled={!settings.apiKey.trim()} onClick={() => void check("fenno-dev-pilot", false, true)}>Run frozen evaluation (200 requests)</button>}
+       {settings.apiKey && <button type="button" onClick={() => change({ ...settings, apiKey: "" })}>Clear key · use offline</button>}
+     </div>
+     <p className="model-notice" role={failed ? "alert" : "status"}>{working ? "Contacting provider…" : notice}</p>
+diff --git a/scripts/evaluate_retrieval_methods.py b/scripts/evaluate_retrieval_methods.py
+index d564231..ff65924 100644
+--- a/scripts/evaluate_retrieval_methods.py
++++ b/scripts/evaluate_retrieval_methods.py
+@@ -8,6 +8,7 @@ unjudged and are counted as non-relevant (a conservative bias against new method
+ 
+ from __future__ import annotations
+ 
++import os
+ import json
+ import sys
+ from datetime import datetime, timezone
+@@ -74,7 +75,7 @@ def main() -> int:
+     payload = {"created_at": datetime.now(timezone.utc).isoformat(), "selected_config": selected,
+                "test_sets": [p.name for p in TEST_SETS], "queries": len(examples), "results": results,
+                "caveat": __doc__.strip().splitlines()[-3:]}
+-    (OUT / "test_results.json").write_text(json.dumps(payload, indent=2) + "\n")
++    (Path(os.environ.get("RETRIEVAL_REPORT_DIR", OUT)) / "test_results.json").write_text(json.dumps(payload, indent=2) + "\n")
+     print(f"{'method':28} {'set':34} n   Hit@10  nDCG@10 MRR@10  All@10")
+     for name, item in results.items():
+         for source, m in item["metrics"]["by_source"].items():
+diff --git a/server.py b/server.py
+index 8fc5b98..abc9ba3 100644
+--- a/server.py
++++ b/server.py
+@@ -280,9 +280,39 @@ def test_provider(req: ProviderRequest):
+             close_generator(generator)
+ 
+ 
++@app.post("/api/llm/fenno-dev-pilot")
++def fenno_dev_pilot(req: ProviderRequest, single: bool = False, full: bool = False):
++    import sys
++    if req.provider != "custom" or custom_base_url(req) != "https://api.fenno.ai/v1" or req.model != "gpt-6.1-sol":
++        raise HTTPException(422, "Select Fenno and gpt-6.1-sol for this development pilot.")
++    if not {"ldsc_partitioned_heritability", "gene_association_wes"}.issubset(allowed_collections()):
++        raise HTTPException(403, "Select a workspace with access to both evidence collections.")
++    script_dir = str(PROJECT_ROOT / "scripts")
++    if script_dir not in sys.path:
++        sys.path.insert(0, script_dir)
++    from fenno_dev_pilot import run_pilot
++    key, model = provider_settings(req)
++    gen = hosted_generator(req.provider, key, model, custom_base_url(req))
++    gen.repair_attempts = 0
++    try:
++        directory = PROJECT_ROOT / "reports/phase_6_claim_dependency/fenno_dev"
++        if full:
++            from fenno_full_eval import run_full
++            return {"message": run_full(gen, directory.parent / "fenno_frozen_50")}
++        count = run_pilot(gen, directory / "single_c4" if single else directory, single=single)
++    except FileExistsError:
++        raise HTTPException(409, "Pilot already started. Check the local results before another run.") from None
++    finally:
++        close_generator(gen)
++    return {"message": f"Pilot finished: {count}/{1 if single else 8} structured responses. Results saved locally."}
++
++
+ class ClaimResponse(BaseModel):
+     text: str
+     citations: list[str]
++    fact: dict | None = None
++    derived: dict | None = None
++    depends_on: list[str] | None = None
+ 
+ 
+ class QueryResponse(BaseModel):
+@@ -366,7 +396,7 @@ def query_rag(req: QueryRequest):
+     total_time = time.perf_counter() - start_time
+ 
+     claims = [
+-        ClaimResponse(text=c.text, citations=c.citations) for c in run.answer.claims
++        ClaimResponse(**asdict(c)) for c in run.answer.claims
+     ]
+     latencies = {**run.latency_s, "total_api": total_time}
+ 
+diff --git a/src/augmentation/builder.py b/src/augmentation/builder.py
+index 5145443..4af49f5 100644
+--- a/src/augmentation/builder.py
++++ b/src/augmentation/builder.py
+@@ -216,6 +216,8 @@ class ContextBuilder:
+                 )
+             )
+         )
++        wes_groups = set()
++        occupied_slots = 0
+         for result in [*priority, *remainder]:
+             if result.collection not in response.effective_collections:
+                 raise PermissionError(f"context isolation violation: {result.chunk_id}")
+@@ -223,6 +225,13 @@ class ContextBuilder:
+                 duplicates_removed += 1
+                 continue
+             chunk = result.chunk
++            meta = chunk.get("metadata") or {}
++            group = meta.get("group_id") if result.collection == "gene_association_wes" else None
++            if group and meta.get("record_kind") == "mask_result":
++                mask = meta.get("mask", "")
++                if not mask or not re.search(r"(?<![\w.-])" + re.escape(mask) + r"(?![\w-])", response.question, re.I):
++                    excluded.append(result.chunk_id)
++                    continue
+             citation = dict(chunk.get("citation") or {})
+             if citation.get("chunk_id") != result.chunk_id:
+                 raise ValueError(f"unresolvable citation for {result.chunk_id}")
+@@ -253,11 +262,15 @@ class ContextBuilder:
+                 passage.title + "\n" + passage.content, self.config.chars_per_token
+             )
+             if (
+-                len(passages) >= self.config.max_passages
++                (occupied_slots >= self.config.max_passages and group not in wes_groups)
+                 or used_tokens + cost > self.config.max_context_tokens
+             ):
+                 excluded.append(result.chunk_id)
+                 continue
++            if group not in wes_groups:
++                occupied_slots += 1
++            if group:
++                wes_groups.add(group)
+             passages.append(passage)
+             seen.add(result.chunk_id)
+             used_tokens += cost
+@@ -303,6 +316,7 @@ class ContextBuilder:
+             diagnostics={
+                 "input_passages": len(response.results),
+                 "selected_passages": len(passages),
++                "wes_evidence_groups": len({p.metadata["group_id"] for p in passages if p.collection == "gene_association_wes" and p.metadata.get("group_id")}),
+                 "excluded_chunk_ids": excluded,
+                 "duplicates_removed": duplicates_removed,
+                 "isolation_violations": 0,
+diff --git a/src/generation/aihubmix.py b/src/generation/aihubmix.py
+index e71be8e..2f85311 100644
+--- a/src/generation/aihubmix.py
++++ b/src/generation/aihubmix.py
+@@ -105,6 +105,20 @@ def _parse_answer(payload: dict[str, Any], context: ContextPackage, model: str)
+     )
+ 
+ 
++def _prompt_metadata(passage):
++    metadata = passage.metadata
++    if passage.collection == "gtex_tissue_expression":
++        return {"gene_symbol": metadata.get("gene_symbol"), "units": None}
++    if passage.collection == "gene_association_wes":
++        # The archive's raw_record also contains sibling masks. Send only the
++        # selected row's statistics so a withdrawn mask cannot leak via its parent.
++        keep = ("gene", "phenotype", "record_kind", "group_id", "mask", "mask_labels",
++                "mask_count", "related_baseline_chunk_id", "raw_parent", "raw_mask")
++        return {key: metadata[key] for key in keep if key in metadata and
++                (key != "raw_parent" or metadata.get("record_kind") == "gene_summary")}
++    return metadata
++
++
+ def _messages(context: ContextPackage) -> list[dict[str, str]]:
+     evidence = [
+         {
+@@ -112,7 +126,7 @@ def _messages(context: ContextPackage) -> list[dict[str, str]]:
+             "collection": passage.collection,
+             "title": passage.title,
+             "content": passage.content,
+-            "metadata": ({"gene_symbol": passage.metadata.get("gene_symbol"), "units": None} if passage.collection == "gtex_tissue_expression" else passage.metadata),
++            "metadata": _prompt_metadata(passage),
+         }
+         for passage in context.passages
+     ]
+diff --git a/src/generation/dependencies.py b/src/generation/dependencies.py
+new file mode 100644
+index 0000000..79ad65a
+--- /dev/null
++++ b/src/generation/dependencies.py
+@@ -0,0 +1,83 @@
++"""Record-bound numeric facts and deterministic two-record comparisons."""
++from math import isfinite
++
++from generation.schema import Claim, Derived, Fact, GeneratedAnswer
++from generation.numeric_validation import NUMBER
++from retrieval.comparison import parse_comparison
++
++
++def source_value(passage, field):
++    metadata = passage.metadata
++    if passage.collection == 'gene_association_wes':
++        key = 'raw_mask' if metadata.get('record_kind') == 'mask_result' else 'raw_parent'
++        metadata = metadata.get(key, {})
++    value = metadata.get(field)
++    if value is None:
++        values = {float(m['number']) for m in NUMBER.finditer(passage.content) if m['field'].lower() == field.lower()}
++        value = values.pop() if len(values) == 1 else None
++    return value if type(value) in (int, float) and isfinite(value) else None
++
++
++def comparison(left, right):
++    relation = 'higher than' if left.value > right.value else 'lower than' if left.value < right.value else 'equal to'
++    return Derived('compare', (left, right), relation, left.value - right.value)
++
++
++def fact_text(fact, label):
++    return f'{label}: {fact.field}={fact.value}.'
++
++
++def derived_text(derived, labels):
++    a, b = derived.operands
++    return f'{labels[0]} ({a.value}) is {derived.relation} {labels[1]} ({b.value}) for {a.field}. Difference (first minus second): {derived.difference}.'
++
++
++def generate_comparison(context):
++    plan = parse_comparison(context.question)
++    if plan is None or plan.collection not in context.effective_collections:
++        return None
++    # Preserve the pipeline's refusal policy for individual medical questions.
++    if context.evidence_status == 'refuse' and any('individual medical advice' in s for s in context.limitations):
++        return None
++    passages = {p.chunk_id: p for p in context.passages if p.collection == plan.collection}
++    facts, claims, missing = [], [], []
++    limits = list(context.limitations)
++    for cid, label in zip(plan.ids, plan.labels):
++        value = source_value(passages[cid], plan.field) if cid in passages else None
++        if value is None:
++            missing.append(cid)
++            limits.append(f'Missing {label} record or field ({cid}, {plan.field}); cannot compare.')
++            continue
++        fact = Fact(cid, plan.field, value)
++        facts.append(fact)
++        claims.append(Claim(fact_text(fact, label), [cid], fact=fact, depends_on=[cid]))
++    if len(facts) == 2:
++        derived = comparison(*facts)
++        claims.append(Claim(derived_text(derived, plan.labels), list(plan.ids), derived=derived, depends_on=list(plan.ids)))
++    ids = [f.chunk_id for f in facts]
++    diagnostics = {'missing_dependencies': missing, 'target_ids': list(plan.ids)}
++    if plan.collection == 'gene_association_wes':
++        diagnostics['wes_evidence_groups'] = len({passages[c].metadata['group_id'] for c in ids})
++        limits.append('Masks from the same gene group are not independent evidence. Cross-collection independence is unknown.')
++    return GeneratedAnswer('qualified' if claims and limits else 'answer' if claims else 'refuse',
++        '\n\n'.join(c.text for c in claims) or 'I cannot answer this question from the authorized approved corpus.',
++        claims, [passages[c].citation for c in ids], limits, provider='claim_dependency', diagnostics=diagnostics)
++
++
++def retract(answer, context):
++    """Recompute the original comparison using only its surviving records."""
++    if answer.provider != 'claim_dependency':
++        raise ValueError('Retraction requires a structured comparison')
++    plan = parse_comparison(context.question)
++    if plan is None or tuple(answer.diagnostics.get('target_ids', ())) != plan.ids:
++        raise ValueError('Changed context must refer to the original comparison')
++    return generate_comparison(context)
++
++
++def dependency_errors(answer, context):
++    if not any(c.depends_on is not None or c.fact or c.derived for c in answer.claims) and answer.provider != 'claim_dependency':
++        return []
++    expected = generate_comparison(context)
++    if expected is None or answer.claims != expected.claims or answer.citations != expected.citations:
++        return ['structured claims differ from recomputed source records, dependencies or citations']
++    return []
+diff --git a/src/generation/numeric_validation.py b/src/generation/numeric_validation.py
+index fb6bb4c..db96314 100644
+--- a/src/generation/numeric_validation.py
++++ b/src/generation/numeric_validation.py
+@@ -11,7 +11,7 @@ from augmentation.schema import ContextPackage
+ from generation.schema import GeneratedAnswer
+ 
+ NUMBER = re.compile(
+-    r"(?P<field>pValue|p[- ]value|mixed_pvalue|mixed_rg|bf_common|bf_rare|enrichment_beta|h2_beta|stdErr|median|beta|rg|z|p)\s*(?:=|:|\bis\b|\bof\b)\s*(?P<number>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)",
++    r"(?P<field>pValue|p[- ]value|mixed_pvalue|mixed_rg|bf_common|bf_rare|enrichment_beta|h2_beta|stdErr|median|beta|rg|z|p)\s*(?:=|:|\bis\b|\bwas\b|\bof\b)\s*(?P<number>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)",
+     re.I,
+ )
+ ALIASES = {"p": "pvalue", "p-value": "pvalue", "p value": "pvalue", "rg": "mixed_rg"}
+@@ -37,17 +37,55 @@ def fields(value):
+     return result
+ 
+ 
++# Only explicit, ordered subtraction has an unambiguous sign.
++DIFFERENCE_PREFIX = re.compile(
++    r"\b(EA|EU|HS|Mixed)[- ]minus[- ](EA|EU|HS|Mixed)\s+difference\s+in\s+(?:reported\s+)?$",
++    re.I,
++)
++
++
++BY_DIFFERENCE = re.compile(
++    r"\b(EA|EU|HS|Mixed)\s+(?:is|was)\s+(higher|lower)\s+than\s+"
++    r"(EA|EU|HS|Mixed)\s+by\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)", re.I,
++)
++
++
++def difference_candidate(labels, field, citations, passages, question):
++    from retrieval.comparison import parse_comparison
++    plan = parse_comparison(question)
++    if not plan or (field is not None and field != plan.field.lower()) or set(citations) != set(plan.ids):
++        return []
++    values = {}
++    for cid, label in zip(plan.ids, plan.labels):
++        passage = passages.get(cid)
++        if not passage or passage.collection != plan.collection:
++            return []
++        value = passage.metadata.get(plan.field)
++        if type(value) not in (float, int) or not math.isfinite(value):
++            return []
++        values[label.lower()] = value
++    left, right = (label.lower() for label in labels)
++    if left == right or left not in values or right not in values:
++        return []
++    return [values[left] - values[right]]
++
++
+ def numeric_errors(answer: GeneratedAnswer, context: ContextPackage) -> list[str]:
+     passages = {p.chunk_id: p for p in context.passages}
+     errors = []
+     claims = [(claim.text, claim.citations) for claim in answer.claims]
+-    claims.append(
+-        (
+-            answer.answer,
+-            list(dict.fromkeys(cid for c in answer.claims for cid in c.citations)),
+-        )
+-    )
++    # validate_answer checks that the body consists entirely of its cited claims.
++    joined = "\n\n".join(c.text for c in answer.claims)
++    prefix = answer.answer.removesuffix(joined) if joined else answer.answer
++    if NUMBER.search(prefix) or BY_DIFFERENCE.search(prefix):
++        claims.append((prefix, list(dict.fromkeys(cid for c in answer.claims for cid in c.citations))))
+     for text, citations in claims:
++        for match in BY_DIFFERENCE.finditer(text):
++            left, direction, right, magnitude = match.groups()
++            labels = (left, right) if direction.lower() == "higher" else (right, left)
++            values = difference_candidate(labels, None, citations, passages, context.question)
++            if not any(v > 0 and math.isclose(float(magnitude), v, rel_tol=5e-4) for v in values):
++                errors.append("unsupported ordered difference: " + match.group())
+         expected = {}
+         for cid in citations:
+             if cid not in passages:
+@@ -65,6 +103,9 @@ def numeric_errors(answer: GeneratedAnswer, context: ContextPackage) -> list[str
+             candidates = expected.get(key, [])
+             if key == "pvalue":
+                 candidates += expected.get("mixed_pvalue", [])
++            order = DIFFERENCE_PREFIX.search(text[:match.start()])
++            if order:
++                candidates = difference_candidate(order.groups(), key, citations, passages, context.question)
+             if not any(
+                 math.isclose(number, truth, rel_tol=5e-4, abs_tol=1e-300)
+                 for truth in candidates
+diff --git a/src/generation/schema.py b/src/generation/schema.py
+index f8fbf2b..138e533 100644
+--- a/src/generation/schema.py
++++ b/src/generation/schema.py
+@@ -6,10 +6,28 @@ from typing import Any, Literal
+ AnswerStatus = Literal["answer", "qualified", "refuse", "error"]
+ 
+ 
++@dataclass(frozen=True)
++class Fact:
++    chunk_id: str
++    field: str
++    value: float
++
++
++@dataclass(frozen=True)
++class Derived:
++    operation: str
++    operands: tuple[Fact, Fact]
++    relation: str
++    difference: float
++
++
+ @dataclass
+ class Claim:
+     text: str
+     citations: list[str]
++    fact: Fact | None = None
++    derived: Derived | None = None
++    depends_on: list[str] | None = None
+ 
+ 
+ @dataclass
+diff --git a/src/generation/validator.py b/src/generation/validator.py
+index 9bb3fd8..1fdc4e2 100644
+--- a/src/generation/validator.py
++++ b/src/generation/validator.py
+@@ -43,6 +43,8 @@ def validate_answer(answer: GeneratedAnswer, context: ContextPackage) -> Validat
+         errors.append("answer body must consist of the cited claims")
+     if answer.status == "refuse" and answer.answer != "I cannot answer this question from the authorized approved corpus.":
+         errors.append("refusal must use the non-factual refusal message")
++    from generation.dependencies import dependency_errors
++    errors.extend(dependency_errors(answer, context))
+     errors.extend(numeric_errors(answer, context))
+     correctness = 1.0 if not cited else sum(cid in allowed for cid in cited) / len(cited)
+     completeness = 1.0 if not answer.claims else sum(bool(c.citations) for c in answer.claims) / len(answer.claims)
+diff --git a/src/rag/pipeline.py b/src/rag/pipeline.py
+index 420d1a7..d15ad36 100644
+--- a/src/rag/pipeline.py
++++ b/src/rag/pipeline.py
+@@ -9,6 +9,7 @@ from pathlib import Path
+ from typing import Any
+ 
+ from augmentation.builder import ContextBuilder
++from generation.dependencies import generate_comparison
+ from generation.provider import GeneratorProvider
+ from generation.schema import GeneratedAnswer
+ from generation.validator import ValidationResult, validate_answer
+@@ -38,7 +39,14 @@ class RAGPipeline:
+         after_retrieval = time.perf_counter()
+         context = self.context_builder.build(retrieval)
+         after_context = time.perf_counter()
+-        answer = self.generator.generate(context)
++        answer = generate_comparison(context) or self.generator.generate(context)
++        wes_groups = context.diagnostics.get('wes_evidence_groups', 0)
++        if wes_groups and answer.provider != 'claim_dependency':
++            cited = {cid for claim in answer.claims for cid in claim.citations}
++            groups = {p.metadata['group_id'] for p in context.passages if p.chunk_id in cited
++                      and p.collection == 'gene_association_wes' and p.metadata.get('group_id')}
++            answer.diagnostics['wes_evidence_groups'] = len(groups)
++            answer.limitations.append(f'WES evidence groups cited: {len(groups)}. Masks within a group are not independent; cross-collection independence is unknown.')
+         validation = validate_answer(answer, context)
+         if not validation.valid:
+             answer = GeneratedAnswer(
+diff --git a/src/retrieval/comparison.py b/src/retrieval/comparison.py
+new file mode 100644
+index 0000000..8802ccd
+--- /dev/null
++++ b/src/retrieval/comparison.py
+@@ -0,0 +1,49 @@
++"""Resolve fully specified record comparisons. Ambiguous requests stay on search."""
++import re
++from dataclasses import dataclass
++from urllib.parse import quote
++
++
++@dataclass(frozen=True)
++class Comparison:
++    collection: str
++    ids: tuple[str, str]
++    labels: tuple[str, str]
++    field: str
++
++
++def parse_comparison(question):
++    if not re.search(r'\b(compare|comparison|difference|higher|lower)\b', question, re.I):
++        return None
++    def terms(pattern):
++        return re.findall(pattern, question, re.I)
++    traits = terms(r'\b(2hrG)\b')
++    if len(traits) != 1:
++        return None
++    fields = terms(r'\b(enrichment_beta|h2_beta|coefficient_beta|diff_beta|pValue|beta)\b')
++    if len(fields) != 1:
++        return None
++    field = 'pValue' if fields[0].lower() == 'pvalue' else fields[0].lower()
++    if re.search(r'\bWES\b', question, re.I):
++        genes = terms(r'\bgene\s+([\w.-]+)')
++        masks = terms(r'\bmask\s+([\w.-]+)')
++        if len(genes) != 1 or field not in {'pValue','beta'}:
++            return None
++        labels = (['summary'] if re.search(r'\bsummary\b', question, re.I) else []) + [m.rstrip('.') for m in masks]
++        if len(labels) != 2 or len(set(labels)) != 2:
++            return None
++        stem = 'wes:2hrG:' + quote(genes[0].rstrip('.'), safe='') + ':'
++        ids = tuple(stem + ('summary' if label == 'summary' else 'mask:' + quote(label, safe='')) for label in labels)
++        return Comparison('gene_association_wes', ids, tuple(labels), field)
++    keys = []
++    for key in ('annotation','tissue','biosample'):
++        matches = terms(r'\b' + key + r'\s+([\w.-]+|\[(?:null|missing)\])')
++        if len(matches) != 1:
++            return None
++        value = matches[0].rstrip('.')
++        keys.append(value if value in {'[null]', '[missing]'} else quote(value, safe=''))
++    labels = re.findall(r'\b(EA|EU|HS|Mixed)\b', question)
++    if len(labels) != 2 or len(set(labels)) != 2 or field == 'beta':
++        return None
++    stem = ':'.join(['ldsc_partitioned','2hrG',*keys,''])
++    return Comparison('ldsc_partitioned_heritability', tuple(stem + s for s in labels), tuple(labels), field)
+diff --git a/src/retrieval/service.py b/src/retrieval/service.py
+index 91f4f68..2605884 100644
+--- a/src/retrieval/service.py
++++ b/src/retrieval/service.py
+@@ -1,10 +1,15 @@
+ from __future__ import annotations
+ 
++import re
+ import time
+ from dataclasses import dataclass, field
+ from typing import Any, Protocol
+ 
+ from retrieval.router import SUPPORTED_COLLECTIONS, route_query
++from functools import cached_property
++from retrieval.comparison import parse_comparison
++from retrieval.corpus import metadata_matches
++from retrieval.access import allowed_collections
+ from retrieval.schema import SearchResult
+ 
+ 
+@@ -54,8 +59,12 @@ class RetrieverService:
+     backend: SearchBackend
+     method: str
+ 
++    @cached_property
++    def record_index(self):
++        return {r.chunk_id: r for r in self.backend.records}
++
+     def retrieve(self, request: RetrievalRequest) -> RetrievalResponse:
+-        authorized = [name for name in SUPPORTED_COLLECTIONS if name in request.authorized_collections]
++        authorized = [name for name in SUPPORTED_COLLECTIONS if name in request.authorized_collections and name in allowed_collections()]
+         if request.use_router:
+             decision = route_query(request.question, available_collections=authorized)
+             routed = decision.collections
+@@ -65,6 +74,16 @@ class RetrieverService:
+             rules = ["router_disabled"]
+         effective = [name for name in routed if name in authorized]
+         started = time.perf_counter()
++        plan = parse_comparison(request.question)
++        if plan and plan.collection in effective and getattr(self.backend, 'records', None) is not None:
++            hits = []
++            for cid in plan.ids:
++                record = self.record_index.get(cid)
++                if record and record.collection == plan.collection and metadata_matches(record, request.filters):
++                    hits.append(SearchResult(cid, record.collection, len(hits)+1, 1.0, 'exact_records', chunk=record.to_dict()))
++            hits = hits[:request.top_k]
++            return RetrievalResponse(request.question, authorized, list(routed), effective, list(rules), hits,
++                'exact_records', time.perf_counter()-started, {'missing_dependencies': [c for c in plan.ids if c not in {h.chunk_id for h in hits}]})
+         results = (
+             self.backend.search(
+                 request.question,
+@@ -75,6 +94,24 @@ class RetrieverService:
+             if effective
+             else []
+         )
++        # Pull the parent row when mask-heavy search results omit a requested gene summary.
++        if getattr(self.backend, 'records', None) is not None and 'gene_association_wes' in effective:
++            # Replace unnamed mask hits in place; keep the search result budget and order.
++            grouped = []
++            known = set()
++            for hit in results:
++                meta = hit.chunk.get('metadata', {})
++                if hit.collection == 'gene_association_wes' and meta.get('record_kind') == 'mask_result':
++                    mask = meta.get('mask', '')
++                    named = mask and re.search(r'(?<![\w.-])' + re.escape(mask) + r'(?![\w-])', request.question, re.I)
++                    if not named and meta.get('group_id'):
++                        parent = self.record_index.get(meta['group_id'] + ':summary')
++                        if parent and parent.collection == hit.collection and metadata_matches(parent, request.filters):
++                            hit = SearchResult(parent.chunk_id, parent.collection, hit.rank, hit.score, self.method, chunk=parent.to_dict())
++                if hit.chunk_id not in known:
++                    grouped.append(hit)
++                    known.add(hit.chunk_id)
++            results = grouped
+         overview = None
+         if hasattr(self.backend, "records") and effective:
+             from retrieval.association_overview import select_association_overview
