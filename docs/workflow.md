@@ -20,4 +20,6 @@
 
 ### 英文简历表述
 
-Built record-level citation tracking for a Python RAG assistant covering 159,607 passages across eight genetics datasets. In 240 paired test questions, the system correctly compared values in 238 cases and retained the supported fact in all 240 when one source was removed. Citation precision rose from 59.4% to 69.0% on a separate 40-question benchmark.
+- Extended a team-built, citation-grounded RAG assistant for a drug-discovery client (Python, FastAPI, BM25; 159,607 passages across 8 genetics datasets) with claim-level dependency tracking: comparisons are computed from the cited records and re-derived by the validator, so removing a source withdraws only the conclusions that depend on it.
+- On 240 frozen paired questions under 4 evidence conditions (1,920 answers), gave the correct comparison in 238 (99.2%, 95% CI 97.0-99.8%) with full evidence, and made 0 unsupported comparisons across 480 missing-evidence runs while keeping the surviving value and citation in all 480; a hosted GPT baseline refused outright in 48 of 78 such responses (50-question sample).
+- Raised citation precision from 59.4% to 69.0% and recall from 82.5% to 87.5% on a separate 40-question blind benchmark by counting same-gene records as one evidence group; Wilson intervals and 10,000-resample paired bootstrap; 291 automated tests.
